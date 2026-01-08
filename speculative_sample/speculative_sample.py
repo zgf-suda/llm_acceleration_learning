@@ -455,7 +455,6 @@ if __name__ == "__main__":
         padding=True
     )
     input_ids = encoding["input_ids"]
-    print("input_ids",input_ids.shape)
     attention_mask = encoding["attention_mask"]
     pixel_values = encoding["pixel_values"]
     image_grid_thw = encoding["image_grid_thw"]

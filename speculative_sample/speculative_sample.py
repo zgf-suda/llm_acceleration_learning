@@ -296,7 +296,6 @@ def _speculative_sampling(
                 draft_k = max(1, draft_k - 1)
         print("target_new_token:",target_new_token)
         prefix = torch.cat((prefix, target_new_token), dim=1)
-        print("current_prefix:",prefix)
         if streamer is not None:
             streamer.put(prefix.cpu())
         if stopping_criteria(prefix, target_probs):

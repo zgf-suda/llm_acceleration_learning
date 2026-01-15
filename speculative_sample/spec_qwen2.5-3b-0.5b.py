@@ -1,4 +1,4 @@
-from transformers import AutoTokenizer, Qwen3VLForConditionalGeneration, GenerationConfig, AutoProcessor
+from transformers import AutoTokenizer, AutoModelForCausalLM, GenerationConfig, PreTrainedModel
 from transformers import (
     LogitsProcessorList,
     StoppingCriteriaList,
@@ -7,12 +7,8 @@ from transformers.generation.streamers import BaseStreamer
 import torch
 from typing import Tuple, List, Optional
 import copy
-from PIL import Image
 from transformers.cache_utils import DynamicCache
 import time
-
-# x是包含图像信息的所有输入
-#probs = norm_logits(x[:,:-1], output.logits, logits_processor, logits_warper, do_sample, x.shape[1]-1)
 def norm_logits(
     x: torch.Tensor,
     logits: torch.Tensor,
@@ -67,7 +63,6 @@ def max_fn(x):
     x_max = torch.where(x > 0, x, torch.zeros_like(x))
     x_max_sum = torch.sum(x_max, dim=1, keepdim=True)
     return x_max / x_max_sum
-
 def ensure_dynamic_cache(past):
     if isinstance(past, DynamicCache):
         return past
@@ -84,8 +79,7 @@ def _draft_model_serial_forward(
     do_sample=False,
     past_key_values=None,
     rejected=False,
-    eos_token_id_tensor = None,
-    is_first = True
+    eos_token_id_tensor = None
 ) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]], torch.Tensor or bool]:
     """ forward draft model draft_k times
 
@@ -106,51 +100,31 @@ def _draft_model_serial_forward(
             generated tokens, probability distribution of draft model's output, 
             past_key_values of draft model, flag of whether last token is eos
     """
-
-    # def ensure_dynamic_cache(past):
-    #     if isinstance(past, DynamicCache):
-    #         return past
-    #     if past is None:
-    #         return DynamicCache()
-    #     return DynamicCache(past)
+    def ensure_dynamic_cache(past):
+        if isinstance(past, DynamicCache):
+            return past
+        if past is None:
+            return DynamicCache()
+        return DynamicCache(past)
 
     x = prefix
+    x = x.to(draft_model.device)
     input_ids = x
     probs = None
-    if past_key_values != None:
+
+    if past_key_values is not None and len(past_key_values)>0 :
         if rejected == False:
-            output = draft_model(input_ids["input_ids"][:,-2:-1], past_key_values = ensure_dynamic_cache(past_key_values), use_cache=True)
+            output = draft_model(input_ids[:,-2:-1], past_key_values = past_key_values, use_cache=True)
             past_key_values = output.past_key_values
-            input_ids["input_ids"] = input_ids["input_ids"][:,-1:]
-            probs = norm_logits(x["input_ids"][:,:-1], output.logits, logits_processor, logits_warper, do_sample, x["input_ids"].shape[1]-1)
-        # else:
-        #     input_ids["input_ids"] = input_ids["input_ids"][:,-1:]
-
-    for idx in range(draft_k):
-        #除了第一次，后续推理都只推一个token
-        if idx == 0 and is_first == False:
-            output = draft_model(
-                input_ids=x["input_ids"][:,-1:].to("cuda"),
-                past_key_values = ensure_dynamic_cache(past_key_values),
-                use_cache=True)
-        elif idx == 0 and is_first == True:
-            output = draft_model(
-            input_ids=input_ids["input_ids"].to("cuda"),
-            pixel_values=input_ids["pixel_values"].to("cuda"),
-            image_grid_thw=input_ids["image_grid_thw"].to("cuda"),
-            attention_mask=input_ids["attention_mask"].to("cuda"),
-            past_key_values = ensure_dynamic_cache(past_key_values),
-            use_cache=True)
+            input_ids = input_ids[:,-1:]
+            probs = norm_logits(x[:,:-1], output.logits, logits_processor, logits_warper, do_sample, x.shape[1]-1)
         else:
-            output = draft_model(
-                input_ids=x["input_ids"][:,-1:].to("cuda"),
-                past_key_values = ensure_dynamic_cache(past_key_values),
-                use_cache=True)
-        new_probs = norm_logits(x["input_ids"].to("cuda"), output.logits[:,-1:], logits_processor, logits_warper, do_sample, x["input_ids"].shape[1])
-        next_tok = sample(new_probs[:, -1, :], do_sample=do_sample)
-        eos_token_id_tensor = eos_token_id_tensor.to("cuda")
+            input_ids = input_ids[:,-1:]
 
-        print("output.shape",x["input_ids"].shape)
+    for _ in range(draft_k):
+        output = draft_model(input_ids, past_key_values = ensure_dynamic_cache(past_key_values), use_cache=True)
+        new_probs = norm_logits(x, output.logits[:,-1:], logits_processor, logits_warper, do_sample, x.shape[1])
+        next_tok = sample(new_probs[:, -1, :], do_sample=do_sample)
         if eos_token_id_tensor is not None:
             last_token_is_eos = next_tok.tile(eos_token_id_tensor.shape[0], 1)
             last_token_is_eos = (
@@ -160,12 +134,11 @@ def _draft_model_serial_forward(
                 break
         else:
             last_token_is_eos = False
-        past_key_values = output.past_key_values #output长度是1，只输出了最后一个token，但是kv缓存会自动增长
+        past_key_values = output.past_key_values
         probs = torch.cat((probs, new_probs), dim=1) if probs != None else torch.cat((output.logits[:,:-1], new_probs), dim=1)
-        x["input_ids"]= torch.cat([x["input_ids"].to("cuda"), next_tok.to("cuda")], dim=1)
-        x["attention_mask"]= torch.cat([x["attention_mask"].to("cuda"), torch.tensor([[1]]).to("cuda")], dim=1)
+        input_ids = next_tok
+        x = torch.cat((x, next_tok), dim=1)
 
-    #所有的x，所有的probs，所有的past_key_values，最后一个token是否是eos
     return x, probs, past_key_values, last_token_is_eos
 
 def _speculative_sampling(
@@ -206,9 +179,9 @@ def _speculative_sampling(
     Returns:
         torch.Tensor: generated tokens (batch, target_seqlen)
     """
-    input_seq_len = prefix["input_ids"].shape[1]
+    input_seq_len = prefix.shape[1]
     T = input_seq_len + max_new_tokens
-    assert prefix["input_ids"].shape[0] == 1, "input batch size must be 1"
+    assert prefix.shape[0] == 1, "input batch size must be 1"
 
     if draft_k <= 0:
         draft_k = 4
@@ -216,24 +189,22 @@ def _speculative_sampling(
     else:
         adaptive_k = False
 
-    draft_past_key_values = None
-    #draft_past_key_values = DynamicCache()
+    #draft_past_key_values = None
+    draft_past_key_values = DynamicCache()
     draft_probs = None
     target_past_key_values = None
     target_probs = None
     rejected = False
-    unfinished_sequences = prefix["input_ids"].new(prefix["input_ids"].shape[0]).fill_(1)
+    unfinished_sequences = prefix.new(prefix.shape[0]).fill_(1)
 
     logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
     logits_warper = logits_warper if logits_warper is not None else LogitsProcessorList()
     if isinstance(eos_token_id, int):
         eos_token_id = [eos_token_id]
-    eos_token_id_tensor = torch.tensor(eos_token_id).to(prefix["input_ids"].device) if eos_token_id is not None else None
+    eos_token_id_tensor = torch.tensor(eos_token_id).to(prefix.device) if eos_token_id is not None else None
     stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
-    is_first = True
-    while prefix["input_ids"].shape[1] < T:
-        prefix_len = prefix["input_ids"].shape[1]
-        print("prefix_len:",prefix_len)
+    while prefix.shape[1] < T:
+        prefix_len = prefix.shape[1]
         x, new_draft_probs, draft_past_key_values, _ = _draft_model_serial_forward(
             prefix,
             draft_k,
@@ -243,10 +214,9 @@ def _speculative_sampling(
             do_sample,
             draft_past_key_values,
             rejected,
-            eos_token_id_tensor,
-            is_first
+            eos_token_id_tensor
         )
-        is_first = False
+
         if draft_probs != None and new_draft_probs != None:
             draft_probs = torch.concat((draft_probs, new_draft_probs), dim=1)
         elif new_draft_probs == None:
@@ -255,25 +225,12 @@ def _speculative_sampling(
             draft_probs = new_draft_probs
 
         if target_past_key_values != None:
-            unchecked_token_count = x["input_ids"].shape[1] - target_probs.shape[1] - 1
-            print(x["input_ids"].shape[1])
-            print(target_probs.shape[1])
-            print("unchecked_token_count",unchecked_token_count)
-            #大模型并行检查小模型输出的结果，一次将所有的unchecked_token_count的概率算出
-            #x就是学生模型输出的tokens
-            outputs = target_model(x["input_ids"][:,-(unchecked_token_count+1):], past_key_values=ensure_dynamic_cache(target_past_key_values), use_cache=True)
+            unchecked_token_count = x.shape[1] - target_probs.shape[1] - 1
+            outputs = target_model(x[:,-(unchecked_token_count+1):], past_key_values=ensure_dynamic_cache(target_past_key_values), use_cache=True)
         else:
-            outputs = target_model(
-               input_ids=x["input_ids"].to("cuda"),
-               pixel_values=x["pixel_values"].to("cuda"),
-               image_grid_thw=x["image_grid_thw"].to("cuda"),
-               attention_mask = x["attention_mask"].to("cuda"),
-               use_cache=True
-           )
-            unchecked_token_count = x["input_ids"].shape[1] - prefix_len
-        
-        new_target_probs = norm_logits(x["input_ids"].to("cuda"), outputs.logits[:,-(unchecked_token_count+1):], logits_processor, logits_warper, do_sample, prefix_len)
-
+            unchecked_token_count = x.shape[1] - prefix_len
+            outputs = target_model(x, use_cache=True)
+        new_target_probs = norm_logits(x, outputs.logits[:,-(unchecked_token_count+1):], logits_processor, logits_warper, do_sample, prefix_len)
         target_probs = torch.cat((target_probs, new_target_probs), dim=1) if target_probs != None else torch.cat((outputs.logits[:,:-(unchecked_token_count+1)], new_target_probs), dim=1)
         target_past_key_values = outputs.past_key_values
 
@@ -282,26 +239,18 @@ def _speculative_sampling(
         n_valid = prefix_len
         for i in range(unchecked_token_count):
             r = torch.rand(1, device = target_probs.device)
-            cur_token_id = x["input_ids"][:, prefix_len + i]
+            cur_token_id = x[:, prefix_len + i]
             cur_pos = prefix_len + i - 1
 
-            #草稿模型大于目标模型：
-                #采样r很小：
-                    #接收
-                #采样r较大：
-                    #拒绝，大模型生成
-            #草稿模型小于目标模型：
-                #接收
             if r < torch.min(
                 torch.tensor([1], device=draft_probs.device),
                 target_probs[:, cur_pos, cur_token_id] / draft_probs[:, cur_pos, cur_token_id]
             ):
                 # accept, and update n_valid
-                print("11")
                 n_valid += 1
+                print("accept")
             else:
                 # reject
-                print("22")
                 target_new_token = sample(
                     max_fn(
                         target_probs[:, n_valid-1, :] - draft_probs[:, n_valid-1, :]
@@ -312,10 +261,9 @@ def _speculative_sampling(
                 break
 
         n_valid = min(n_valid, T - 1)
-        prefix["input_ids"] = x["input_ids"][:, :n_valid]
-
+        prefix = x[:, :n_valid]
+        print("is_all_accept",is_all_accept)
         if is_all_accept:
-            print("33")
             target_new_token = sample(target_probs[:, -1, :], do_sample=do_sample)
             rejected = False
         else:
@@ -346,18 +294,15 @@ def _speculative_sampling(
                 draft_k += 2
             else:
                 draft_k = max(1, draft_k - 1)
-
-        prefix["input_ids"] = torch.cat((prefix["input_ids"].to("cuda"), target_new_token), dim=1)
+        prefix = torch.cat((prefix, target_new_token), dim=1)
         if streamer is not None:
-            streamer.put(prefix["input_ids"].cpu())
-        if stopping_criteria(prefix["input_ids"], target_probs):
+            streamer.put(prefix.cpu())
+        if stopping_criteria(prefix, target_probs):
             # this_peer_finished = True
             break
-        eos_token_id_tensor = eos_token_id_tensor.to("cuda")
-        unfinished_sequences = unfinished_sequences.to("cuda")
         if eos_token_id_tensor is not None:
             unfinished_sequences = unfinished_sequences.mul(
-                prefix["input_ids"][:, -1]
+                prefix[:, -1]
                 .tile(eos_token_id_tensor.shape[0], 1)
                 .ne(eos_token_id_tensor.unsqueeze(1))
                 .prod(dim=0)
@@ -371,6 +316,7 @@ def _speculative_sampling(
         streamer.end()
 
     return prefix
+
 
 def speculative_sample(
     input_ids,
@@ -396,9 +342,9 @@ def speculative_sample(
         input_ids, generation_config.bos_token_id, model_kwargs
     )
 
-    model_kwargs["use_cache"] = generation_config.use_cache #缓存kv和图像的embedding信息
+    model_kwargs["use_cache"] = generation_config.use_cache
 
-    input_ids_seq_length = input_ids["input_ids"].shape[-1]
+    input_ids_seq_length = input_ids.shape[-1]
     has_default_max_length = kwargs.get("max_length") is None and generation_config.max_length is not None
     if has_default_max_length and generation_config.max_new_tokens is None:
     #     warnings.warn(
@@ -476,46 +422,40 @@ def speculative_sample(
 
 if __name__ == "__main__":
     # A usage example
-    draft_model_name = '/mnt/nova_ssd/zgf_doc/qwen3-vl-2b-grpo'
-    target_model_name = '/mnt/nova_ssd/zgf_doc/models--Qwen--Qwen3-VL-4B-Instruct/snapshots/qwen3-vl-4b'
-    image = Image.open("/mnt/nova_ssd/zgf_doc/llm_related-main/KD_qwen2.5-vl/images/train-00000-of-00001_image_3_0.jpg").convert('RGB')
+    draft_model_name = "/mnt/nova_ssd/zgf_doc/llm_acceleration_learning/speculative_sample/models--Qwen--Qwen2.5-3B-Instruct/snapshots/qwen2.5-3b"
+    target_model_name = "/mnt/nova_ssd/zgf_doc/llm_acceleration_learning/speculative_sample/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/qwen2.5-0.5b"
 
     DEFAULT_SYSTEM_PROMPT = """You are a helpful assistant. 你是一个乐于助人的助手。"""
-    tokenizer = AutoTokenizer.from_pretrained(target_model_name)
-    processor = AutoProcessor.from_pretrained(target_model_name)
 
-    messages = [{"role":"system", "content":'You are a helpful assistant.'},{"role":"user", "content":"<image> 写个100字的诗歌"}]
-    text = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        ).replace('<image>', '<|image_pad|>')  #qwen3叫image_pad
-    encoding = processor(
-        text=text,
-        images=image,
-        return_tensors="pt",
-        padding=True
+    TEMPLATE = (
+        "[INST] <<SYS>>\n"
+        "{system_prompt}\n"
+        "<</SYS>>\n\n"
+        "{instruction} [/INST]"
     )
-    input_ids = encoding["input_ids"]
-    attention_mask = encoding["attention_mask"]
-    pixel_values = encoding["pixel_values"]
-    image_grid_thw = encoding["image_grid_thw"]
-    input_ids = {
-                'input_ids': input_ids,
-                'pixel_values': pixel_values,
-                "image_grid_thw": image_grid_thw,
-                "attention_mask":attention_mask
-                }   
+
+    def generate_prompt(instruction, system_prompt=DEFAULT_SYSTEM_PROMPT):
+        return TEMPLATE.format_map({'instruction': instruction,'system_prompt': system_prompt})
+
+    #inputs = ["我能用lightning数据线给安卓手机充电吗？"]
+    inputs = ["人生自古谁无死"]
+    
+    negative_text = generate_prompt(inputs[0], system_prompt="回复尽可能多的内容。")
+    inputs = [generate_prompt(text) for text in inputs]
+
+    tokenizer = AutoTokenizer.from_pretrained(target_model_name)
+
     print("begin loading models")
-    draft_model = Qwen3VLForConditionalGeneration.from_pretrained(
+    draft_model = AutoModelForCausalLM.from_pretrained(
         draft_model_name,
         torch_dtype=torch.float16,
         low_cpu_mem_usage=True,
         device_map='auto',
         load_in_8bit=False
-    ) 
-    #draft_model.resize_token_embeddings(len(tokenizer)) #草稿模型tokenizer调整为词库大小
+    )
+    #draft_model.resize_token_embeddings(len(tokenizer))
     print(f"Load {draft_model_name}")
-    target_model = Qwen3VLForConditionalGeneration.from_pretrained(
+    target_model = AutoModelForCausalLM.from_pretrained(
         target_model_name,
         torch_dtype=torch.float16,
         low_cpu_mem_usage=True,
@@ -528,12 +468,17 @@ if __name__ == "__main__":
     print("finish loading models")
 
     torch_device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+    input_ids = tokenizer.encode(inputs[0], return_tensors='pt').to(torch_device)
+
+    negative_inputs = tokenizer(negative_text,return_tensors="pt")
+    negative_prompt_ids = negative_inputs["input_ids"].to(torch_device)
+    negative_prompt_attention_mask = negative_inputs["attention_mask"].to(torch_device)
 
     generation_config = GenerationConfig(
         temperature=0.2,
         top_k=40,
         top_p=0.9,
-        do_sample=True, #不是按照概率最大的采样，按照top_p/top_k/temperature的配置随机采样
+        do_sample=True,
         num_beams=1,
         repetition_penalty=1.1,
         max_new_tokens=128,

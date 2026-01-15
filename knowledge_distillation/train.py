@@ -165,7 +165,7 @@ class SFTDataset(Dataset):
                 return_tensors="pt",
                 padding=True
             )
-            input_ids = encoding["input_ids"].squeeze(0)
+            input_ids = encoding["input_ids"].squeeze(0) #所有的token id 包括了图像图像占位符。前向推理时再把图像像素值一起丢给模型处理
             attention_mask = encoding["attention_mask"].squeeze(0)
             pixel_values = encoding["pixel_values"].squeeze(0)
             image_grid_thw = encoding["image_grid_thw"].squeeze(0)

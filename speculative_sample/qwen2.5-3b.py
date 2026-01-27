@@ -3,7 +3,7 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # 模型路径
-target_model_name = "/mnt/nova_ssd/zgf_doc/llm_acceleration_learning/speculative_sample/models--Qwen--Qwen2.5-3B-Instruct/snapshots/qwen2.5-3b"
+target_model_name = "/home/user/qwen3-vl-2b"
 
 # 系统提示模板
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant. 你是一个乐于助人的助手。"
